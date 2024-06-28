@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 logger = logging.getLogger("FediFetcher")
 robotParser = urllib.robotparser.RobotFileParser()
 
-VERSION = "7.1.1"
+VERSION = "7.1.3"
 
 argparser=argparse.ArgumentParser()
 
@@ -48,6 +48,9 @@ argparser.add_argument('--state-dir', required = False, default="artifacts", hel
 argparser.add_argument('--on-done', required = False, default=None, help="Provide a url that will be pinged when processing has completed. You can use this for 'dead man switch' monitoring of your task")
 argparser.add_argument('--on-start', required = False, default=None, help="Provide a url that will be pinged when processing is starting. You can use this for 'dead man switch' monitoring of your task")
 argparser.add_argument('--on-fail', required = False, default=None, help="Provide a url that will be pinged when processing has failed. You can use this for 'dead man switch' monitoring of your task")
+argparser.add_argument('--from-lists', required=False, type=bool, default=False, help="Set to `1` to fetch missing replies and/or backfill account from your lists. This is disabled by default.")
+argparser.add_argument('--max-list-length', required=False, type=int, default=100, help="Determines how many posts we'll fetch replies for in each list. This will be ignored, unless you also provide `from-lists = 1`. Set to `0` if you only want to backfill profiles in lists.")
+argparser.add_argument('--max-list-accounts', required=False, type=int, default=10, help="Determines how many accounts we'll backfill for in each list. This will be ignored, unless you also provide `from-lists = 1`. Set to `0` if you only want to fetch replies in lists.")
 
 def get_notification_users(server, access_token, known_users, max_age):
     since = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=max_age)
@@ -112,7 +115,20 @@ def add_post_with_context(post, server, access_token, seen_urls, seen_hosts):
     
     return False
 
+def user_has_opted_out(user):
+    if 'note' in user and isinstance(user['note'], str) and (' nobot' in user['note'].lower() or '/tags/nobot' in user['note'].lower()):
+        return True
+    if 'indexable' in user and not user['indexable']:
+        return True
+    if 'discoverable' in user and not user['discoverable']:
+        return True
+    return False
+        
+
 def get_user_posts(user, known_followings, server, seen_hosts):
+    if user_has_opted_out(user):
+        logger.debug(f"User {user['acct']} has opted out of backfilling")
+        return None
     parsed_url = parse_user_url(user['url'])
 
     if parsed_url == None:
@@ -317,7 +333,6 @@ def get_user_id(server, user = None, access_token = None):
         raise Exception(
             f"Error getting URL {url}. Status code: {response.status_code}"
         )
-
 
 def get_timeline(server, access_token, max):
     """Get all post in the user's home timeline"""
@@ -738,22 +753,13 @@ def get_redirect_url(url):
 
 def get_all_context_urls(server, replied_toot_ids, seen_hosts):
     """get the URLs of the context toots of the given toots"""
-    known_context_urls = set()
-    for (url, (server, toot_id)) in replied_toot_ids:
-        if(toot_context_should_be_fetched(toot)):
-            recently_checked_context[toot['uri']]['lastSeen'] = datetime.now(datetime.now().astimezone().tzinfo)
-            context = get_toot_context(server, toot_id, url, seen_hosts)
-            if context is not None:
-                for item in context:
-                    known_context_urls.add(item)
-            else:
-                logger.error(f"Error getting context for toot {url}")
-
-    known_context_urls = set(filter(lambda url: not url.startswith(f"https://{server}/"), known_context_urls))
-    
-    logger.info(f"Found {len(known_context_urls)} known context toots")
-    
-    return known_context_urls
+    return filter(
+        lambda url: not url.startswith(f"https://{server}/"),
+        itertools.chain.from_iterable(
+            get_toot_context(server, toot_id, url, seen_hosts)
+            for (url, (server, toot_id)) in replied_toot_ids
+        ),
+    )
 
 
 def get_toot_context(server, toot_id, toot_url, seen_hosts):
@@ -1015,19 +1021,31 @@ def can_fetch(user_agent, url):
         else:
             robotsTxt = ROBOTS_TXT[robots]
     else:
-        try:
-            # We are getting the robots.txt manually from here, because otherwise we can't change the User Agent
-            robotsTxt = get(robots, timeout = 2, ignore_robots_txt=True)
-            if robotsTxt.status_code in (401, 403):
-                ROBOTS_TXT[robots] = False
-                return False
-            elif robotsTxt.status_code != 200:
-                ROBOTS_TXT[robots] = True
-                return True
-            robotsTxt = robotsTxt.text
+        robotsCachePath = os.path.join(arguments.state_dir, f'robots-{parsed_uri.netloc}')
+        if os.path.exists(robotsCachePath):
+            with open(robotsCachePath, "r", encoding="utf-8") as f:
+                logger.debug(f"Getting robots.txt file from cache {parsed_uri.netloc}")
+                robotsTxt = f.read()
             ROBOTS_TXT[robots] = robotsTxt
-        except Exception as ex:
-            return True
+
+        else:
+            try:
+                # We are getting the robots.txt manually from here, because otherwise we can't change the User Agent
+                robotsTxt = get(robots, timeout = 2, ignore_robots_txt=True)
+                if robotsTxt.status_code in (401, 403):
+                    ROBOTS_TXT[robots] = False
+                    return False
+                elif robotsTxt.status_code != 200:
+                    ROBOTS_TXT[robots] = True
+                    return True
+                robotsTxt = robotsTxt.text
+                ROBOTS_TXT[robots] = robotsTxt
+                
+                with open(robotsCachePath, "w", encoding="utf-8") as f:
+                    f.write(robotsTxt)
+
+            except Exception as ex:
+                return True
     
     robotParser = urllib.robotparser.RobotFileParser()
     robotParser.parse(robotsTxt.splitlines())
@@ -1315,6 +1333,33 @@ def set_server_apis(server):
 
     server['last_checked'] = datetime.now()
 
+def get_user_lists(server, token):
+    return get_paginated_mastodon(f"https://{server}/api/v1/lists", 99, {
+        "Authorization": f"Bearer {token}",
+    })
+
+def get_list_timeline(server, list, token, max):
+    """Get all post in the user's home timeline"""
+
+    url = f"https://{server}/api/v1/timelines/list/{list['id']}"
+
+    posts = get_paginated_mastodon(url, max, {
+        "Authorization": f"Bearer {token}",
+    })
+
+    logger.info(f"Found {len(posts)} toots in list {list['title']}")
+
+    return posts
+
+def get_list_users(server, list, token, max):
+    url = f"https://{server}/api/v1/lists/{list['id']}/accounts"
+    accounts = get_paginated_mastodon(url, max, {
+        "Authorization": f"Bearer {token}",
+    })
+    logger.info(f"Found {len(accounts)} accounts in list {list['title']}")
+    return accounts
+
+
 if __name__ == "__main__":
     start = datetime.now()
 
@@ -1467,10 +1512,34 @@ if __name__ == "__main__":
         else:
             seen_hosts = ServerList({})
 
+        # Delete any old robots.txt files so we can re-download them
+        for file_name in os.listdir(arguments.state_dir):
+            file_path = os.path.join(arguments.state_dir,file_name)
+            if file_name.startswith('robots-') and os.path.isfile(file_path):
+                if os.path.getmtime(file_path) < time.time() - 60 * 60 * 24:
+                    logger.debug(f"Removing cached robots.txt file {file_name}")
+                    os.remove(file_path)
+            
+
         if(isinstance(arguments.access_token, str)):
             setattr(arguments, 'access_token', [arguments.access_token])
 
         for token in arguments.access_token:
+
+            if arguments.from_lists:
+                """Pull replies from lists"""
+                lists = get_user_lists(arguments.server, token)
+                for list in lists:
+                    # Fill context from list
+                    if arguments.max_list_length > 0:
+                        timeline_toots = get_list_timeline(arguments.server, list, token, arguments.max_list_length)
+                        known_context_urls = get_all_known_context_urls(arguments.server, timeline_toots,parsed_urls, seen_hosts)
+                        add_context_urls(arguments.server, token, known_context_urls, seen_urls)
+
+                    # Backfill profiles from list
+                    if arguments.max_list_accounts:
+                        accounts = get_list_users(arguments.server, list, token, arguments.max_list_accounts)
+                        add_user_posts(arguments.server, token, accounts, recently_checked_users, all_known_users, seen_urls, seen_hosts)
 
             if arguments.reply_interval_in_hours > 0:
                 """pull the context toots of toots user replied to, from their
